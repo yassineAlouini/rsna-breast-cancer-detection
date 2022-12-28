@@ -15,6 +15,7 @@ import pytorch_lightning as pl
 import timm
 from pytorch_lightning import Trainer, seed_everything
 from torch.utils.data import random_split, DataLoader
+import torch.optim as optim
 
 DATA_FOLDER = "/home/yassinealouini/Documents/Kaggle/rsna-breast-cancer-detection/1024_data/"
 
@@ -153,6 +154,8 @@ def get_transfos(augment=True, visualize=False):
         p=1,
     )
 
+transforms = get_transfos()
+
 df = pd.read_csv("train.csv")
 df['path'] = DATA_FOLDER + df["patient_id"].astype(str) + "_" + df["image_id"].astype(str) + ".png"
 
@@ -193,15 +196,17 @@ class BreastCancerModel(pl.LightningModule):
     def forward(self, x):
         batch_size = x.shape[0]
         x = self.backbone(x)
-        x = self.pooling(x).view(batch_size, -1)
-
+        print(x.shape)
+        x = self.pooling(x)
+        # .view(batch_size, -1)
         x = self.dropout(x)
+        print(x.shape)
         x = self.fc(x)
         x = self.bn(x)
 
     def training_step(self, batch, batch_idx):
         # get data and labels from batch
-        x, y = batch
+        x, y, _ = batch
         # forward pass
         y_hat = self(x)
         # calculate loss
@@ -210,31 +215,42 @@ class BreastCancerModel(pl.LightningModule):
         self.log('train_loss', loss)
         return loss
 
-    def validation_step(self, batch, batch_idx, group):
+    def validation_step(self, batch, batch_idx):
         # get data and labels from batch
-        x, y = batch
+        x, y, _ = batch
         # forward pass
         y_hat = self(x)
         # calculate loss
         loss = self.loss_fn(y_hat, y)
         # log loss to tensorboard
-        self.log('val_loss', loss, on_epoch=True, prog_bar=True, group=group)
+        self.log('val_loss', loss, on_epoch=True, prog_bar=True)
         # calculate accuracy
         acc = self.accuracy(y_hat, y)
-        self.log('val_acc', acc, on_epoch=True, prog_bar=True, group=group)
+        self.log('val_acc', acc, on_epoch=True, prog_bar=True)
         return {'val_loss': loss, 'val_acc': acc}
 
-    def validation_epoch_end(self, outputs, group):
+    def validation_epoch_end(self, outputs):
         # calculate mean loss and accuracy across all validation batches
         avg_loss = torch.stack([x['val_loss'] for x in outputs]).mean()
         avg_acc = torch.stack([x['val_acc'] for x in outputs]).mean()
         # log mean loss and accuracy to tensorboard
-        self.log('val_loss', avg_loss, on_epoch=True, prog_bar=True, group=group)
-        self.log('val_acc', avg_acc, on_epoch=True, prog_bar=True, group=group)
+        self.log('val_loss', avg_loss, on_epoch=True, prog_bar=True)
+        self.log('val_acc', avg_acc, on_epoch=True, prog_bar=True)
         return {'val_loss': avg_loss, 'val_acc': avg_acc}
 
     def test_step(self, batch, batch_id):
         pass
+
+
+    def configure_optimizers(self):
+        optimizer = eval("optim.AdamW")(
+            self.parameters(), lr=3e-4, betas=(0.9, 0.999),
+        )
+        # scheduler = eval(self.cfg.scheduler.name)(
+        #     optimizer,
+        #     **self.cfg.scheduler.params
+        # )
+        return [optimizer]
 
 
 class BreastCancerDataModule(pl.LightningDataModule):
@@ -244,8 +260,8 @@ class BreastCancerDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
 
     def setup(self, stage: str):
-        self.breast_test = BreastDataset()
-        self.breast_train = BreastDataset()
+        self.breast_test = BreastDataset(df, transforms)
+        self.breast_train = BreastDataset(df, transforms)
 
     def train_dataloader(self):
         return DataLoader(self.breast_train, batch_size=self.batch_size)
@@ -261,6 +277,7 @@ class BreastCancerDataModule(pl.LightningDataModule):
 seed_everything(42, workers=True)
 # sets seeds for numpy, torch and python.random.
 model = BreastCancerModel(learning_rate=3e-4, num_classes=1, batch_size=32)
+# trainer = Trainer(deterministic=True, accelerator="gpu", devices=1)
 trainer = Trainer(deterministic=True)
 dm = BreastCancerDataModule()
 trainer.fit(model, dm)
