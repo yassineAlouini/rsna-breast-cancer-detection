@@ -13,7 +13,8 @@ import torch.optim as optim
 import torch.utils.data as data
 import pytorch_lightning as pl
 import timm
-
+from pytorch_lightning import Trainer, seed_everything
+from torch.utils.data import random_split, DataLoader
 
 DATA_FOLDER = "/home/yassinealouini/Documents/Kaggle/rsna-breast-cancer-detection/1024_data/"
 
@@ -35,7 +36,7 @@ class Config:
     k = 4  # Stratified GKF
 
     # Model
-    name = "tf_efficientnetv2_s"
+    name = "efficientnet_b2"
     pretrained_weights = None
     # Cancer or not cancer (so binary predictions)
     num_classes = 1
@@ -167,24 +168,36 @@ print(img.mean(), img.max(), img.min())
 # TODO: Finish...
 class BreastCancerModel(pl.LightningModule):
 
-    def __init__(self, num_classes, data_dir, batch_size, learning_rate, 
-                 num_groups, group_size):
+    def __init__(self, num_classes, batch_size, learning_rate):
         super().__init__()
         self.num_classes = num_classes
-        self.data_dir = data_dir
         self.batch_size = batch_size
         self.learning_rate = learning_rate
-        self.num_groups = num_groups
-        self.group_size = group_size
 
         # define model, loss function, and optimizer
-        # TODO: Replace with timm import...
-        self.model = enet.EfficientNet.from_name('efficientnet-b0')
         self.loss_fn = nn.CrossEntropyLoss()
-        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
+
+
+        # A bit inspired from here: https://www.kaggle.com/tanulsingh077/pytorch-metric-learning-pipeline-only-images
+        # Trying 'efficientnet_b3' for now.
+        self.backbone = timm.create_model("efficientnet_b2", pretrained=True)
+        final_in_features = self.backbone.classifier.in_features
+        self.pooling =  nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(p=0.5)
+        self.fc = nn.Linear(final_in_features, self.num_classes)
+        self.bn = nn.BatchNorm1d(self.num_classes)
+
+
+        self.optimizer = optim.Adam(self.backbone.parameters(), lr=learning_rate)
 
     def forward(self, x):
-        return self.model(x)
+        batch_size = x.shape[0]
+        x = self.backbone(x)
+        x = self.pooling(x).view(batch_size, -1)
+
+        x = self.dropout(x)
+        x = self.fc(x)
+        x = self.bn(x)
 
     def training_step(self, batch, batch_idx):
         # get data and labels from batch
@@ -222,3 +235,32 @@ class BreastCancerModel(pl.LightningModule):
 
     def test_step(self, batch, batch_id):
         pass
+
+
+class BreastCancerDataModule(pl.LightningDataModule):
+    def __init__(self, data_dir: str = "path/to/dir", batch_size: int = 32):
+        super().__init__()
+        self.data_dir = data_dir
+        self.batch_size = batch_size
+
+    def setup(self, stage: str):
+        self.breast_test = BreastDataset()
+        self.breast_train = BreastDataset()
+
+    def train_dataloader(self):
+        return DataLoader(self.breast_train, batch_size=self.batch_size)
+
+    def val_dataloader(self):
+        return DataLoader(self.breast_test, batch_size=self.batch_size)
+
+    def test_dataloader(self):
+        return DataLoader(self.breast_test, batch_size=self.batch_size)
+
+
+
+seed_everything(42, workers=True)
+# sets seeds for numpy, torch and python.random.
+model = BreastCancerModel(learning_rate=3e-4, num_classes=1, batch_size=32)
+trainer = Trainer(deterministic=True)
+dm = BreastCancerDataModule()
+trainer.fit(model, dm)
