@@ -17,15 +17,24 @@ from pytorch_lightning import Trainer, seed_everything
 from torch.utils.data import random_split, DataLoader
 import torch.optim as optim
 from timm.models.layers.adaptive_avgmax_pool import SelectAdaptivePool2d
+from pathlib import Path
+from torch.nn import Flatten
+# Objective: make a first model using efficient net and 512 size images.
+# Add wandb logger
+# Make an inference
 
 
+import cv2
+import torch
+from torch.utils.data import Dataset
+import torch.nn as nn
+
+
+LOCAL = False
+CLOUD = True
 # Get this from Kaggle infra
-if LOCAL:
-    DATA_FOLDER = "/home/yassinealouini/Documents/Kaggle/rsna-breast-cancer-detection/1024_data/"
-
-if CLOUD:
-    # Some data to try the pipeline
-    DATA_FOLDER = "1024_data/"
+BASE_FOLDER = str(Path(__file__).parent)
+DATA_FOLDER = BASE_FOLDER + "/1024_data/"
 
 
 
@@ -86,14 +95,7 @@ class Config:
 """
 
 
-# Objective: make a first model using efficient net and 512 size images.
-# Add wandb logger
-# Make an inference
 
-
-import cv2
-import torch
-from torch.utils.data import Dataset
 
 
 class BreastDataset(Dataset):
@@ -166,10 +168,10 @@ def get_transfos(augment=True, visualize=False):
 
 transforms = get_transfos()
 
-df = pd.read_csv("train.csv")
+df = pd.read_csv(BASE_FOLDER + "/train.csv")
 df['path'] = DATA_FOLDER + df["patient_id"].astype(str) + "_" + df["image_id"].astype(str) + ".png"
 
-print(df.head())
+print(df["path"].head().T)
 
 # To be continued...
 
@@ -196,19 +198,19 @@ class BreastCancerModel(pl.LightningModule):
         self.dropout = nn.Dropout(p=0.5)
         self.fc = nn.Linear(final_in_features, self.num_classes)
         self.bn = nn.BatchNorm1d(self.num_classes)
-
+        self.head = nn.Sequential(SelectAdaptivePool2d(pool_type='avg', flatten=Flatten()), nn.Linear(1280, 2))
 
         self.optimizer = optim.Adam(self.backbone.parameters(), lr=learning_rate)
 
     def forward(self, x):
-        batch_size = x.shape[0]
         x = self.backbone(x)
         print(x.shape)
-        x = self.pooling(x).view(batch_size, -1)
-        x = self.dropout(x)
-        print(x.shape)
-        x = self.fc(x)
-        x = self.bn(x)
+        # x = self.pooling(x).view(batch_size, -1)
+        # x = self.dropout(x)
+        # print(x.shape)
+        # x = self.fc(x)
+        # x = self.bn(x)
+        return self.head(x)
 
     def training_step(self, batch, batch_idx):
         # get data and labels from batch
@@ -243,10 +245,6 @@ class BreastCancerModel(pl.LightningModule):
         self.log('val_loss', avg_loss, on_epoch=True, prog_bar=True)
         self.log('val_acc', avg_acc, on_epoch=True, prog_bar=True)
         return {'val_loss': avg_loss, 'val_acc': avg_acc}
-
-    def test_step(self, batch, batch_id):
-        pass
-
 
     def configure_optimizers(self):
         optimizer = eval("optim.AdamW")(
