@@ -16,8 +16,18 @@ import timm
 from pytorch_lightning import Trainer, seed_everything
 from torch.utils.data import random_split, DataLoader
 import torch.optim as optim
+from timm.models.layers.adaptive_avgmax_pool import SelectAdaptivePool2d
 
-DATA_FOLDER = "/home/yassinealouini/Documents/Kaggle/rsna-breast-cancer-detection/1024_data/"
+
+# Get this from Kaggle infra
+if LOCAL:
+    DATA_FOLDER = "/home/yassinealouini/Documents/Kaggle/rsna-breast-cancer-detection/1024_data/"
+
+if CLOUD:
+    # Some data to try the pipeline
+    DATA_FOLDER = "1024_data/"
+
+
 
 # From https://www.kaggle.com/code/theoviel/rsna-breast-baseline-inference
 class Config:
@@ -159,11 +169,8 @@ transforms = get_transfos()
 df = pd.read_csv("train.csv")
 df['path'] = DATA_FOLDER + df["patient_id"].astype(str) + "_" + df["image_id"].astype(str) + ".png"
 
+print(df.head())
 
-dataset = BreastDataset(df)
-img, target, weight = dataset[0]
-
-print(img.mean(), img.max(), img.min())
 # To be continued...
 
 
@@ -197,8 +204,7 @@ class BreastCancerModel(pl.LightningModule):
         batch_size = x.shape[0]
         x = self.backbone(x)
         print(x.shape)
-        x = self.pooling(x)
-        # .view(batch_size, -1)
+        x = self.pooling(x).view(batch_size, -1)
         x = self.dropout(x)
         print(x.shape)
         x = self.fc(x)
