@@ -4,4 +4,5 @@ albumentations
 pytorch-lightning
 timm
 kaggle
+modal-client
   

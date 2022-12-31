@@ -1,37 +1,60 @@
-# import cv2
+import modal
+stub = modal.Stub(name="train-rsna")
+image = modal.Image.debian_slim().run_commands(
+    "apt-get install -y software-properties-common",
+    "apt-add-repository non-free",
+    "apt-add-repository contrib",
+    "apt-get update",
+    "apt install unzip",
+    "pip install kaggle",
+    "mkdir -p ~/.kaggle/",
+    'echo \'{"username":"yassinealouini", "key":"63ead6c78a5527a8d12f6a3ca41e3c48"}\' >> test.json',
+    "cp test.json  ~/.kaggle/kaggle.json",
+    "chmod 600 ~/.kaggle/kaggle.json",
+    # Download data
+    "kaggle datasets download -d awsaf49/rsna-bcd-roi-1024x-png-dataset",
+    # Unzip
+    "unzip rsna-bcd-roi-1024x-png-dataset.zip -d 1024_data"
+).pip_install(
+    # When using pip PyTorch is not automatically installed by fastai.
+    "torch~=1.12.1",
+    "torchvision~=0.13.1",
+    "pytorch-lightning",
+    "wandb~=0.13.4",
+    "albumentations",
+    "pandas"
+)
+volume = modal.SharedVolume().persist("1024_data")
+
+USE_GPU = "A100"
+
+
+
 import albumentations as albu
 from albumentations.pytorch import ToTensorV2
-from pytorch_lightning import LightningModule
 import torch
 import pandas as pd
-import os
-import random
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.utils.data as data
 import pytorch_lightning as pl
 import timm
 from pytorch_lightning import Trainer, seed_everything
-from torch.utils.data import random_split, DataLoader
+from torch.utils.data import DataLoader
 import torch.optim as optim
 from timm.models.layers.adaptive_avgmax_pool import SelectAdaptivePool2d
 from pathlib import Path
 from torch.nn import Flatten
-# Objective: make a first model using efficient net and 512 size images.
-# Add wandb logger
-# Make an inference
-
-
+import modal
 import cv2
 import torch
 from torch.utils.data import Dataset
 import torch.nn as nn
 
+# Objective: make a first model using efficient net and 512 size images (or maybe 1024).
+# Add wandb logger => in progress...
+# Make an inference
 
-LOCAL = False
-CLOUD = True
 # Get this from Kaggle infra
 BASE_FOLDER = str(Path(__file__).parent)
 DATA_FOLDER = BASE_FOLDER + "/1024_data/"
@@ -278,10 +301,25 @@ class BreastCancerDataModule(pl.LightningDataModule):
 
 
 
-seed_everything(42, workers=True)
-# sets seeds for numpy, torch and python.random.
-model = BreastCancerModel(learning_rate=3e-4, num_classes=1, batch_size=32)
-# trainer = Trainer(deterministic=True, accelerator="gpu", devices=1)
-trainer = Trainer(deterministic=True)
-dm = BreastCancerDataModule()
-trainer.fit(model, dm)
+
+# TODO: Make it a modal thing...
+@stub.function(
+    image=image,
+    gpu=USE_GPU,
+    shared_volumes={"/1024_data": volume},
+    # secret=modal.Secret.from_name("wandb"),
+    # TODO: Probably more...
+    timeout=2700,  # 45 minutes
+)
+def train():
+    seed_everything(42, workers=True)
+    # sets seeds for numpy, torch and python.random.
+    model = BreastCancerModel(learning_rate=3e-4, num_classes=1, batch_size=32)
+    # trainer = Trainer(deterministic=True, accelerator="gpu", devices=1)
+    trainer = Trainer(deterministic=True, accelerator="gpu")
+    dm = BreastCancerDataModule()
+    trainer.fit(model, dm)
+
+
+with stub.run():
+    train()
