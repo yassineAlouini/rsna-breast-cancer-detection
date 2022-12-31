@@ -16,17 +16,19 @@ image = modal.Image.debian_slim().run_commands(
     # Unzip
     "unzip rsna-bcd-roi-1024x-png-dataset.zip -d 1024_data"
 ).pip_install(
-    # When using pip PyTorch is not automatically installed by fastai.
-    "torch~=1.12.1",
-    "torchvision~=0.13.1",
+    "torch",
+    "torchvision",
     "pytorch-lightning",
     "wandb~=0.13.4",
     "albumentations",
-    "pandas"
-)
-volume = modal.SharedVolume().persist("1024_data")
+    "pandas",
+    "timm"
+).run_commands("export GIT_PYTHON_REFRESH=quiet", 
+               "apt-get install git -y",
+               "mv 1024_data ~/1024_data")
+volume = modal.SharedVolume().persist("train-rsna")
 
-USE_GPU = "A100"
+USE_GPU = "any"
 
 
 
@@ -57,7 +59,7 @@ import torch.nn as nn
 
 # Get this from Kaggle infra
 BASE_FOLDER = str(Path(__file__).parent)
-DATA_FOLDER = BASE_FOLDER + "/1024_data/"
+DATA_FOLDER = "/1024_data/"
 
 
 
@@ -184,6 +186,7 @@ def get_transfos(augment=True, visualize=False):
     return albu.Compose(
         [
             albu.Normalize(mean=0, std=1),
+            albu.Resize(1024, 1024),
             ToTensorV2(),
         ],
         p=1,
@@ -191,10 +194,7 @@ def get_transfos(augment=True, visualize=False):
 
 transforms = get_transfos()
 
-df = pd.read_csv(BASE_FOLDER + "/train.csv")
-df['path'] = DATA_FOLDER + df["patient_id"].astype(str) + "_" + df["image_id"].astype(str) + ".png"
 
-print(df["path"].head().T)
 
 # To be continued...
 
@@ -217,17 +217,18 @@ class BreastCancerModel(pl.LightningModule):
         # Trying 'efficientnet_b3' for now.
         self.backbone = timm.create_model("efficientnet_b2", pretrained=True)
         final_in_features = self.backbone.classifier.in_features
+        print(final_in_features)
         self.pooling =  nn.AdaptiveAvgPool2d(1)
         self.dropout = nn.Dropout(p=0.5)
-        self.fc = nn.Linear(final_in_features, self.num_classes)
         self.bn = nn.BatchNorm1d(self.num_classes)
-        self.head = nn.Sequential(SelectAdaptivePool2d(pool_type='avg', flatten=Flatten()), nn.Linear(1280, 2))
+        self.head = nn.Sequential(SelectAdaptivePool2d(pool_type='avg', flatten=Flatten()), 
+                                  nn.Linear(final_in_features, 1))
 
         self.optimizer = optim.Adam(self.backbone.parameters(), lr=learning_rate)
 
     def forward(self, x):
         x = self.backbone(x)
-        print(x.shape)
+        print("I am here...", x.shape)
         # x = self.pooling(x).view(batch_size, -1)
         # x = self.dropout(x)
         # print(x.shape)
@@ -281,20 +282,23 @@ class BreastCancerModel(pl.LightningModule):
 
 
 class BreastCancerDataModule(pl.LightningDataModule):
-    def __init__(self, data_dir: str = "path/to/dir", batch_size: int = 32):
+    def __init__(self, data_dir: str = "path/to/dir", batch_size: int = 64):
         super().__init__()
         self.data_dir = data_dir
         self.batch_size = batch_size
+        df = pd.read_csv(data_dir + "train.csv")
+        df['path'] = data_dir + "train_images/" + df["patient_id"].astype(str) + "/" + df["image_id"].astype(str) + ".png"
+        self.df = df
 
     def setup(self, stage: str):
-        self.breast_test = BreastDataset(df, transforms)
-        self.breast_train = BreastDataset(df, transforms)
+        self.breast_test = BreastDataset(self.df, transforms)
+        self.breast_train = BreastDataset(self.df, transforms)
 
     def train_dataloader(self):
-        return DataLoader(self.breast_train, batch_size=self.batch_size)
+        return DataLoader(self.breast_train, batch_size=self.batch_size, num_workers=4)
 
     def val_dataloader(self):
-        return DataLoader(self.breast_test, batch_size=self.batch_size)
+        return DataLoader(self.breast_test, batch_size=self.batch_size, num_workers=4)
 
     def test_dataloader(self):
         return DataLoader(self.breast_test, batch_size=self.batch_size)
@@ -306,20 +310,23 @@ class BreastCancerDataModule(pl.LightningDataModule):
 @stub.function(
     image=image,
     gpu=USE_GPU,
-    shared_volumes={"/1024_data": volume},
     # secret=modal.Secret.from_name("wandb"),
     # TODO: Probably more...
-    timeout=2700,  # 45 minutes
+    timeout=2 * 3600,  # 45 minutes
+    mounts=[]
 )
 def train():
     seed_everything(42, workers=True)
     # sets seeds for numpy, torch and python.random.
-    model = BreastCancerModel(learning_rate=3e-4, num_classes=1, batch_size=32)
+    model = BreastCancerModel(learning_rate=3e-4, num_classes=1, batch_size=16)
     # trainer = Trainer(deterministic=True, accelerator="gpu", devices=1)
     trainer = Trainer(deterministic=True, accelerator="gpu")
-    dm = BreastCancerDataModule()
+    import os
+    # print("I am here...", os.listdir("/root/1024_data/train_images/"))
+    dm = BreastCancerDataModule(data_dir="/root/1024_data/")
     trainer.fit(model, dm)
 
 
-with stub.run():
-    train()
+if __name__ == "__main__":
+    with stub.run():
+        train()
