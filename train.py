@@ -197,7 +197,23 @@ transforms = get_transfos()
 
 
 # To be continued...
+def pfbeta_torch(labels, predictions, beta=1.0):
+    y_true_count = torch.sum(labels)
+    ctp = 0
+    cfp = 0
 
+    predictions = torch.clamp(predictions, min=0, max=1)
+    ctp = torch.sum(predictions * labels)
+    cfp = torch.sum(predictions * (1.0-labels))
+
+    beta_squared = beta * beta
+    c_precision = ctp / (ctp + cfp)
+    c_recall = ctp / y_true_count
+    if (c_precision > 0 and c_recall > 0):
+        result = (1 + beta_squared) * (c_precision * c_recall) / (beta_squared * c_precision + c_recall)
+        return result
+    else:
+        return 0
 
 
 # TODO: Finish...
@@ -215,25 +231,18 @@ class BreastCancerModel(pl.LightningModule):
 
         # A bit inspired from here: https://www.kaggle.com/tanulsingh077/pytorch-metric-learning-pipeline-only-images
         # Trying 'efficientnet_b3' for now.
-        self.backbone = timm.create_model("efficientnet_b2", pretrained=True)
+        self.backbone = timm.create_model("tf_efficientnet_b0_ns", pretrained=True)
         final_in_features = self.backbone.classifier.in_features
-        print(final_in_features)
         self.pooling =  nn.AdaptiveAvgPool2d(1)
         self.dropout = nn.Dropout(p=0.5)
         self.bn = nn.BatchNorm1d(self.num_classes)
         self.head = nn.Sequential(SelectAdaptivePool2d(pool_type='avg', flatten=Flatten()), 
-                                  nn.Linear(final_in_features, 1))
-
+                                  nn.Linear(1280, 1))
+        self.fc = nn.Linear(1000, 1)
         self.optimizer = optim.Adam(self.backbone.parameters(), lr=learning_rate)
 
     def forward(self, x):
-        x = self.backbone(x)
-        print("I am here...", x.shape)
-        # x = self.pooling(x).view(batch_size, -1)
-        # x = self.dropout(x)
-        # print(x.shape)
-        # x = self.fc(x)
-        # x = self.bn(x)
+        x = self.backbone.forward_features(x)
         return self.head(x)
 
     def training_step(self, batch, batch_idx):
@@ -257,18 +266,18 @@ class BreastCancerModel(pl.LightningModule):
         # log loss to tensorboard
         self.log('val_loss', loss, on_epoch=True, prog_bar=True)
         # calculate accuracy
-        acc = self.accuracy(y_hat, y)
-        self.log('val_acc', acc, on_epoch=True, prog_bar=True)
-        return {'val_loss': loss, 'val_acc': acc}
+        score = pfbeta_torch(y_hat, y)
+        self.log('val_pfbeta', score, on_epoch=True, prog_bar=True)
+        return {'val_loss': loss, 'val_pfbeta': score}
 
     def validation_epoch_end(self, outputs):
         # calculate mean loss and accuracy across all validation batches
         avg_loss = torch.stack([x['val_loss'] for x in outputs]).mean()
-        avg_acc = torch.stack([x['val_acc'] for x in outputs]).mean()
+        avg_acc = torch.stack([x['val_pfbeta'] for x in outputs]).mean()
         # log mean loss and accuracy to tensorboard
         self.log('val_loss', avg_loss, on_epoch=True, prog_bar=True)
-        self.log('val_acc', avg_acc, on_epoch=True, prog_bar=True)
-        return {'val_loss': avg_loss, 'val_acc': avg_acc}
+        self.log('val_pfbeta', avg_acc, on_epoch=True, prog_bar=True)
+        return {'val_loss': avg_loss, 'val_pfbeta': avg_acc}
 
     def configure_optimizers(self):
         optimizer = eval("optim.AdamW")(
@@ -282,7 +291,7 @@ class BreastCancerModel(pl.LightningModule):
 
 
 class BreastCancerDataModule(pl.LightningDataModule):
-    def __init__(self, data_dir: str = "path/to/dir", batch_size: int = 64):
+    def __init__(self, data_dir: str = "path/to/dir", batch_size: int = 16):
         super().__init__()
         self.data_dir = data_dir
         self.batch_size = batch_size
