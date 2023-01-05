@@ -32,6 +32,8 @@ USE_GPU = "any"
 
 
 
+
+
 import albumentations as albu
 from albumentations.pytorch import ToTensorV2
 import torch
@@ -52,16 +54,9 @@ import cv2
 import torch
 from torch.utils.data import Dataset
 import torch.nn as nn
-
-# Objective: make a first model using efficient net and 512 size images (or maybe 1024).
-# Add wandb logger => in progress...
-# Make an inference
-
-# Get this from Kaggle infra
-BASE_FOLDER = str(Path(__file__).parent)
-DATA_FOLDER = "/1024_data/"
-
-
+import pytorch_lightning as pl
+from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 
 # From https://www.kaggle.com/code/theoviel/rsna-breast-baseline-inference
 class Config:
@@ -216,7 +211,6 @@ def pfbeta_torch(labels, predictions, beta=1.0):
         return 0
 
 
-# TODO: Finish...
 class BreastCancerModel(pl.LightningModule):
 
     def __init__(self, num_classes, batch_size, learning_rate):
@@ -226,7 +220,7 @@ class BreastCancerModel(pl.LightningModule):
         self.learning_rate = learning_rate
 
         # define model, loss function, and optimizer
-        self.loss_fn = nn.CrossEntropyLoss()
+        self.loss_fn = nn.BCEWithLogitsLoss()
 
 
         # A bit inspired from here: https://www.kaggle.com/tanulsingh077/pytorch-metric-learning-pipeline-only-images
@@ -265,19 +259,19 @@ class BreastCancerModel(pl.LightningModule):
         loss = self.loss_fn(y_hat, y)
         # log loss to tensorboard
         self.log('val_loss', loss, on_epoch=True, prog_bar=True)
-        # calculate accuracy
+        # calculate F1 but probabilistic
         score = pfbeta_torch(y_hat, y)
         self.log('val_pfbeta', score, on_epoch=True, prog_bar=True)
         return {'val_loss': loss, 'val_pfbeta': score}
 
-    def validation_epoch_end(self, outputs):
-        # calculate mean loss and accuracy across all validation batches
-        avg_loss = torch.stack([x['val_loss'] for x in outputs]).mean()
-        avg_acc = torch.stack([x['val_pfbeta'] for x in outputs]).mean()
-        # log mean loss and accuracy to tensorboard
-        self.log('val_loss', avg_loss, on_epoch=True, prog_bar=True)
-        self.log('val_pfbeta', avg_acc, on_epoch=True, prog_bar=True)
-        return {'val_loss': avg_loss, 'val_pfbeta': avg_acc}
+    # def validation_epoch_end(self, outputs):
+    #     # calculate mean loss and accuracy across all validation batches
+    #     # avg_loss = torch.stack([x['val_loss'] for x in outputs]).mean()
+    #     # avg_acc = torch.stack([x['val_pfbeta'] for x in outputs]).mean()
+    #     # log mean loss and accuracy to tensorboard
+    #     self.log('val_loss', avg_loss, on_epoch=True, prog_bar=True)
+    #     self.log('val_pfbeta', avg_acc, on_epoch=True, prog_bar=True)
+    #     return {'val_loss': avg_loss, 'val_pfbeta': avg_acc}
 
     def configure_optimizers(self):
         optimizer = eval("optim.AdamW")(
@@ -314,6 +308,41 @@ class BreastCancerDataModule(pl.LightningDataModule):
 
 
 
+def train():
+    seed_everything(42, workers=True)
+    # sets seeds for numpy, torch and python.random.
+    for fold in range(4):
+        print(f"====== Fold: {fold} ======")
+        model = BreastCancerModel(learning_rate=3e-4, num_classes=1, batch_size=8)
+        wandb_logger = WandbLogger(
+            project='rsna-breast-cancer', 
+            job_type='train', 
+            config=Config
+        )
+
+        logger = TensorBoardLogger("lightning_logs", name="rsna-breast-cancer")
+
+        checkpoint_callback = ModelCheckpoint(
+            dirpath="checkpoints",
+            filename= f"fold_{fold}_efficient_net",
+            save_top_k=1,
+            verbose=True,
+            monitor="val_loss",
+            mode="min"
+        )
+
+        early_stopping_callback = EarlyStopping(monitor='val_loss', patience=2)
+        trainer = Trainer(accelerator="gpu", devices=1,
+                  logger=wandb_logger,
+                  callbacks=[checkpoint_callback, early_stopping_callback],
+                  max_epochs=10,
+                  progress_bar_refresh_rate=30,
+                  precision=16)
+        data_dir = "/home/yassinealouini/Documents/Kaggle/rsna-breast-cancer-detection/1024_data/"
+        dm = BreastCancerDataModule(data_dir=data_dir, batch_size=8)
+        trainer.fit(model, dm)
+
+
 
 # TODO: Make it a modal thing...
 @stub.function(
@@ -321,21 +350,20 @@ class BreastCancerDataModule(pl.LightningDataModule):
     gpu=USE_GPU,
     # secret=modal.Secret.from_name("wandb"),
     # TODO: Probably more...
-    timeout=2 * 3600,  # 45 minutes
+    timeout=2 * 3600,  # 2 hours maybe more...
     mounts=[]
 )
-def train():
+def modal_train():
     seed_everything(42, workers=True)
     # sets seeds for numpy, torch and python.random.
     model = BreastCancerModel(learning_rate=3e-4, num_classes=1, batch_size=16)
-    # trainer = Trainer(deterministic=True, accelerator="gpu", devices=1)
     trainer = Trainer(deterministic=True, accelerator="gpu")
-    import os
-    # print("I am here...", os.listdir("/root/1024_data/train_images/"))
     dm = BreastCancerDataModule(data_dir="/root/1024_data/")
     trainer.fit(model, dm)
 
 
 if __name__ == "__main__":
-    with stub.run():
-        train()
+    # with stub.run():
+    #     modal_train()
+    train()
+    # TODO: Add wandb monitoring, fix loss...
