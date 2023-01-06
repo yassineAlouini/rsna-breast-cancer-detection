@@ -57,7 +57,7 @@ import torch.nn as nn
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
-
+from box import Box
 # From https://www.kaggle.com/code/theoviel/rsna-breast-baseline-inference
 class Config:
     """
@@ -285,39 +285,44 @@ class BreastCancerModel(pl.LightningModule):
 
 
 class BreastCancerDataModule(pl.LightningDataModule):
-    def __init__(self, data_dir: str = "path/to/dir", batch_size: int = 16):
+    def __init__(self, data_dir: str = "path/to/dir", batch_size: int = 16, fold=0):
         super().__init__()
         self.data_dir = data_dir
         self.batch_size = batch_size
-        df = pd.read_csv(data_dir + "train.csv")
+        df = pd.read_csv(data_dir + "sgkf_train.csv")
+
         df['path'] = data_dir + "train_images/" + df["patient_id"].astype(str) + "/" + df["image_id"].astype(str) + ".png"
-        self.df = df
+        # Filter using the fold.
+        train_df = df[df["fold"] != fold]
+        val_df = df[df["fold"] == fold]
+        self.train_df = train_df
+        self.val_df = val_df
 
     def setup(self, stage: str):
-        self.breast_test = BreastDataset(self.df, transforms)
-        self.breast_train = BreastDataset(self.df, transforms)
+        self.breast_train = BreastDataset(self.train_df, transforms)
+        self.breast_val = BreastDataset(self.val_df, transforms)
 
     def train_dataloader(self):
         return DataLoader(self.breast_train, batch_size=self.batch_size, num_workers=4)
 
     def val_dataloader(self):
-        return DataLoader(self.breast_test, batch_size=self.batch_size, num_workers=4)
+        return DataLoader(self.breast_val, batch_size=self.batch_size, num_workers=4, shuffle=True)
 
     def test_dataloader(self):
-        return DataLoader(self.breast_test, batch_size=self.batch_size)
+        return DataLoader(self.breast_val, batch_size=self.batch_size)
 
 
-
+# https://www.youtube.com/watch?v=hOkQSR33yLY&list=PLvc14zohWxi3gTNT_deSJY2LOksaY_fn_&index=2
 def train():
     seed_everything(42, workers=True)
     # sets seeds for numpy, torch and python.random.
     for fold in range(4):
         print(f"====== Fold: {fold} ======")
-        model = BreastCancerModel(learning_rate=3e-4, num_classes=1, batch_size=8)
+        batch_size = 16
         wandb_logger = WandbLogger(
             project='rsna-breast-cancer', 
             job_type='train', 
-            config=Config
+            # config=Config
         )
 
         logger = TensorBoardLogger("lightning_logs", name="rsna-breast-cancer")
@@ -330,8 +335,8 @@ def train():
             monitor="val_loss",
             mode="min"
         )
-
         early_stopping_callback = EarlyStopping(monitor='val_loss', patience=2)
+        model = BreastCancerModel(learning_rate=3e-4, num_classes=1, batch_size=batch_size)
         trainer = Trainer(accelerator="gpu", devices=1,
                   logger=wandb_logger,
                   callbacks=[checkpoint_callback, early_stopping_callback],
@@ -339,12 +344,11 @@ def train():
                   progress_bar_refresh_rate=30,
                   precision=16)
         data_dir = "/home/yassinealouini/Documents/Kaggle/rsna-breast-cancer-detection/1024_data/"
-        dm = BreastCancerDataModule(data_dir=data_dir, batch_size=8)
+        dm = BreastCancerDataModule(data_dir=data_dir, batch_size=batch_size)
         trainer.fit(model, dm)
 
 
 
-# TODO: Make it a modal thing...
 @stub.function(
     image=image,
     gpu=USE_GPU,
