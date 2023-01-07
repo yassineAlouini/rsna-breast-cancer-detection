@@ -1,4 +1,37 @@
 import modal
+
+
+
+
+
+
+import albumentations as albu
+from albumentations.pytorch import ToTensorV2
+import torch
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import pytorch_lightning as pl
+import timm
+from pytorch_lightning import Trainer, seed_everything
+from torch.utils.data import DataLoader
+import torch.optim as optim
+from timm.models.layers.adaptive_avgmax_pool import SelectAdaptivePool2d
+from pathlib import Path
+from torch.nn import Flatten
+import modal
+import cv2
+import torch
+from torch.utils.data import Dataset
+import torch.nn as nn
+import pytorch_lightning as pl
+from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+from box import Box
+from rsna.metric import pfbeta_torch_thresh, pfbeta_torch
+
+
 stub = modal.Stub(name="train-rsna")
 image = modal.Image.debian_slim().run_commands(
     "apt-get install -y software-properties-common",
@@ -30,34 +63,10 @@ volume = modal.SharedVolume().persist("train-rsna")
 
 USE_GPU = "any"
 
+# TODO: Why is this the optimal threshold? Most likely not...
+THRESHOLD = 0.402
+DEBUG = False
 
-
-
-
-import albumentations as albu
-from albumentations.pytorch import ToTensorV2
-import torch
-import pandas as pd
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import pytorch_lightning as pl
-import timm
-from pytorch_lightning import Trainer, seed_everything
-from torch.utils.data import DataLoader
-import torch.optim as optim
-from timm.models.layers.adaptive_avgmax_pool import SelectAdaptivePool2d
-from pathlib import Path
-from torch.nn import Flatten
-import modal
-import cv2
-import torch
-from torch.utils.data import Dataset
-import torch.nn as nn
-import pytorch_lightning as pl
-from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
-from box import Box
 # From https://www.kaggle.com/code/theoviel/rsna-breast-baseline-inference
 class Config:
     """
@@ -76,7 +85,7 @@ class Config:
     k = 4  # Stratified GKF
 
     # Model
-    name = "efficientnet_b2"
+    name = "tf_efficientnetv2_b2"
     pretrained_weights = None
     # Cancer or not cancer (so binary predictions)
     num_classes = 1
@@ -182,6 +191,7 @@ def get_transfos(augment=True, visualize=False):
         [
             albu.Normalize(mean=0, std=1),
             albu.Resize(1024, 1024),
+            albu.HorizontalFlip(p=0.5),
             ToTensorV2(),
         ],
         p=1,
@@ -191,26 +201,6 @@ transforms = get_transfos()
 
 
 
-# To be continued...
-def pfbeta_torch(labels, predictions, beta=1.0):
-    y_true_count = torch.sum(labels)
-    ctp = 0
-    cfp = 0
-
-    predictions = torch.clamp(predictions, min=0, max=1)
-    ctp = torch.sum(predictions * labels)
-    cfp = torch.sum(predictions * (1.0-labels))
-
-    beta_squared = beta * beta
-    c_precision = ctp / (ctp + cfp)
-    c_recall = ctp / y_true_count
-    if (c_precision > 0 and c_recall > 0):
-        result = (1 + beta_squared) * (c_precision * c_recall) / (beta_squared * c_precision + c_recall)
-        return result
-    else:
-        return 0
-
-
 class BreastCancerModel(pl.LightningModule):
 
     def __init__(self, num_classes, batch_size, learning_rate):
@@ -218,26 +208,18 @@ class BreastCancerModel(pl.LightningModule):
         self.num_classes = num_classes
         self.batch_size = batch_size
         self.learning_rate = learning_rate
-
-        # define model, loss function, and optimizer
+        # TODO: How was this weight computed?
         self.loss_fn = nn.BCEWithLogitsLoss()
-
-
-        # A bit inspired from here: https://www.kaggle.com/tanulsingh077/pytorch-metric-learning-pipeline-only-images
-        # Trying 'efficientnet_b3' for now.
-        self.backbone = timm.create_model("tf_efficientnet_b0_ns", pretrained=True)
+        self.backbone = timm.create_model("tf_efficientnetv2_b2", pretrained=True)
         final_in_features = self.backbone.classifier.in_features
-        self.pooling =  nn.AdaptiveAvgPool2d(1)
-        self.dropout = nn.Dropout(p=0.5)
-        self.bn = nn.BatchNorm1d(self.num_classes)
-        self.head = nn.Sequential(SelectAdaptivePool2d(pool_type='avg', flatten=Flatten()), 
-                                  nn.Linear(1280, 1))
-        self.fc = nn.Linear(1000, 1)
+        self.head = nn.Sequential(SelectAdaptivePool2d(pool_type='avg', flatten=Flatten()),
+                                  nn.Linear(final_in_features, self.num_classes))
         self.optimizer = optim.Adam(self.backbone.parameters(), lr=learning_rate)
 
     def forward(self, x):
         x = self.backbone.forward_features(x)
-        return self.head(x)
+        x = self.head(x)
+        return x
 
     def training_step(self, batch, batch_idx):
         # get data and labels from batch
@@ -260,23 +242,29 @@ class BreastCancerModel(pl.LightningModule):
         # log loss to tensorboard
         self.log('val_loss', loss, on_epoch=True, prog_bar=True)
         # calculate F1 but probabilistic
+        # TODO: Add the threshold optimized one...
         score = pfbeta_torch(y_hat, y)
+        thresh_score = pfbeta_torch_thresh(y_hat, y)
         self.log('val_pfbeta', score, on_epoch=True, prog_bar=True)
-        return {'val_loss': loss, 'val_pfbeta': score}
+        self.log('val_thresh_pfbeta', thresh_score, on_epoch=True, prog_bar=True)
+        return {'val_loss': loss, 'val_pfbeta': score, 'val_thresh_pfbeta': thresh_score}
 
-    # def validation_epoch_end(self, outputs):
-    #     # calculate mean loss and accuracy across all validation batches
-    #     # avg_loss = torch.stack([x['val_loss'] for x in outputs]).mean()
-    #     # avg_acc = torch.stack([x['val_pfbeta'] for x in outputs]).mean()
-    #     # log mean loss and accuracy to tensorboard
-    #     self.log('val_loss', avg_loss, on_epoch=True, prog_bar=True)
-    #     self.log('val_pfbeta', avg_acc, on_epoch=True, prog_bar=True)
-    #     return {'val_loss': avg_loss, 'val_pfbeta': avg_acc}
+    def validation_epoch_end(self, outputs):
+        # calculate mean loss and accuracy across all validation batches
+        avg_loss = torch.stack([x['val_loss'] for x in outputs]).mean()
+        avg_f1 = torch.stack([x['val_pfbeta'] for x in outputs]).mean()
+        avg_thresh_f1 = torch.stack([x['val_thresh_pfbeta'] for x in outputs]).mean()
+        # log mean loss and accuracy to tensorboard
+        self.log('val_loss', avg_loss, on_epoch=True, prog_bar=True)
+        self.log('val_pfbeta', avg_f1, on_epoch=True, prog_bar=True)
+        self.log('val_thresh_pfbeta', avg_thresh_f1, on_epoch=True, prog_bar=True)
+        return {'val_loss': avg_loss, 'val_pfbeta': avg_f1, 'val_thresh_pfbeta': avg_thresh_f1}
 
     def configure_optimizers(self):
         optimizer = eval("optim.AdamW")(
             self.parameters(), lr=3e-4, betas=(0.9, 0.999),
         )
+        # TODO: Something fancy?
         # scheduler = eval(self.cfg.scheduler.name)(
         #     optimizer,
         #     **self.cfg.scheduler.params
@@ -312,6 +300,9 @@ class BreastCancerDataModule(pl.LightningDataModule):
         return DataLoader(self.breast_val, batch_size=self.batch_size)
 
 
+def class2dict(f):
+    return dict((name, getattr(f, name)) for name in dir(f) if not name.startswith('__'))
+
 # https://www.youtube.com/watch?v=hOkQSR33yLY&list=PLvc14zohWxi3gTNT_deSJY2LOksaY_fn_&index=2
 def train():
     seed_everything(42, workers=True)
@@ -322,27 +313,30 @@ def train():
         wandb_logger = WandbLogger(
             project='rsna-breast-cancer', 
             job_type='train', 
-            # config=Config
+            # TODO: Make this work...
+            config=class2dict(Config)
         )
-
-        logger = TensorBoardLogger("lightning_logs", name="rsna-breast-cancer")
+        model_name = Config.name
+        logger = TensorBoardLogger("/home/yassinealouini/Documents/Kaggle/rsna-breast-cancer-detection/lightning_logs/", 
+                                   name="rsna-breast-cancer")
 
         checkpoint_callback = ModelCheckpoint(
-            dirpath="checkpoints",
-            filename= f"fold_{fold}_efficient_net",
+            dirpath="/home/yassinealouini/Documents/Kaggle/rsna-breast-cancer-detection/checkpoints/",
+            filename= f"fold_{fold}_{model_name}",
             save_top_k=1,
             verbose=True,
             monitor="val_loss",
             mode="min"
         )
         early_stopping_callback = EarlyStopping(monitor='val_loss', patience=2)
-        model = BreastCancerModel(learning_rate=3e-4, num_classes=1, batch_size=batch_size)
+        model = BreastCancerModel(learning_rate=1e-4, num_classes=1, batch_size=batch_size)
         trainer = Trainer(accelerator="gpu", devices=1,
                   logger=wandb_logger,
                   callbacks=[checkpoint_callback, early_stopping_callback],
-                  max_epochs=10,
+                  max_epochs=4,
                   progress_bar_refresh_rate=30,
-                  precision=16)
+                  precision=16,
+                  fast_dev_run=DEBUG)
         data_dir = "/home/yassinealouini/Documents/Kaggle/rsna-breast-cancer-detection/1024_data/"
         dm = BreastCancerDataModule(data_dir=data_dir, batch_size=batch_size)
         trainer.fit(model, dm)
@@ -370,4 +364,3 @@ if __name__ == "__main__":
     # with stub.run():
     #     modal_train()
     train()
-    # TODO: Add wandb monitoring, fix loss...

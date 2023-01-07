@@ -8,13 +8,12 @@ sgkf = StratifiedGroupKFold(
 )
 
 df = pd.read_csv("/home/yassinealouini/Documents/Kaggle/rsna-breast-cancer-detection/1024_data/train.csv")
+patient_id_any_cancer = df.groupby('patient_id').cancer.max().reset_index()
 
 # Need this to map label strings to ids for the dataset
 
 
-for fold, (train_idx, val_idx) in enumerate(sgkf.split(df, df["cancer"], df["patient_id"])):
+for fold, (train_idx, val_idx) in enumerate(sgkf.split(patient_id_any_cancer.patient_id, patient_id_any_cancer.cancer)):
     df.loc[val_idx, "fold"] = fold
-    print(len(val_idx))
-    print(val_idx[:5])
 
 df.to_csv("/home/yassinealouini/Documents/Kaggle/rsna-breast-cancer-detection/1024_data/sgkf_train.csv")
