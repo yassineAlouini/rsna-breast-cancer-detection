@@ -30,7 +30,7 @@ from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from box import Box
 from rsna.metric import pfbeta_torch_thresh, pfbeta_torch
-
+import wandb
 
 stub = modal.Stub(name="train-rsna")
 image = modal.Image.debian_slim().run_commands(
@@ -168,10 +168,8 @@ class BreastDataset(Dataset):
             image = self.transforms(image=image)["image"]
 
         y = torch.tensor([self.targets[idx]], dtype=torch.float)
-        # TODO: Probably not needed...
-        w = torch.tensor([1])
 
-        return image, y, w
+        return image, y
 
 
 
@@ -200,6 +198,28 @@ def get_transfos(augment=True, visualize=False):
 transforms = get_transfos()
 
 
+class ImagePredictionLogger(pl.callbacks.Callback):
+    def __init__(self, val_samples, num_samples=32):
+        super().__init__()
+        self.num_samples = num_samples
+        self.val_imgs, self.val_labels = val_samples
+    
+    def on_validation_epoch_end(self, trainer, pl_module):
+        # Bring the tensors to CPU
+        val_imgs = self.val_imgs.to(device=pl_module.device)
+        val_labels = self.val_labels.to(device=pl_module.device)
+        # Get model prediction
+        logits = pl_module(val_imgs)
+        preds = torch.argmax(logits, -1)
+        # Log the images as wandb Image
+        trainer.logger.experiment.log({
+            "examples":[wandb.Image(x, caption=f"Pred:{pred}, Label:{y}") 
+                           for x, pred, y in zip(val_imgs[:self.num_samples], 
+                                                 preds[:self.num_samples], 
+                                                 val_labels[:self.num_samples])]
+            })
+        
+
 
 class BreastCancerModel(pl.LightningModule):
 
@@ -210,7 +230,7 @@ class BreastCancerModel(pl.LightningModule):
         self.learning_rate = learning_rate
         # TODO: How was this weight computed?
         self.loss_fn = nn.BCEWithLogitsLoss()
-        self.backbone = timm.create_model("tf_efficientnetv2_b2", pretrained=True)
+        self.backbone = timm.create_model("tf_efficientnetv2_b0", pretrained=True)
         final_in_features = self.backbone.classifier.in_features
         self.head = nn.Sequential(SelectAdaptivePool2d(pool_type='avg', flatten=Flatten()),
                                   nn.Linear(final_in_features, self.num_classes))
@@ -223,7 +243,7 @@ class BreastCancerModel(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         # get data and labels from batch
-        x, y, _ = batch
+        x, y = batch
         # forward pass
         y_hat = self(x)
         # calculate loss
@@ -234,7 +254,7 @@ class BreastCancerModel(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         # get data and labels from batch
-        x, y, _ = batch
+        x, y = batch
         # forward pass
         y_hat = self(x)
         # calculate loss
@@ -259,6 +279,7 @@ class BreastCancerModel(pl.LightningModule):
         self.log('val_pfbeta', avg_f1, on_epoch=True, prog_bar=True)
         self.log('val_thresh_pfbeta', avg_thresh_f1, on_epoch=True, prog_bar=True)
         return {'val_loss': avg_loss, 'val_pfbeta': avg_f1, 'val_thresh_pfbeta': avg_thresh_f1}
+
 
     def configure_optimizers(self):
         optimizer = eval("optim.AdamW")(
@@ -286,7 +307,7 @@ class BreastCancerDataModule(pl.LightningDataModule):
         self.train_df = train_df
         self.val_df = val_df
 
-    def setup(self, stage: str):
+    def setup(self):
         self.breast_train = BreastDataset(self.train_df, transforms)
         self.breast_val = BreastDataset(self.val_df, transforms)
 
@@ -309,7 +330,7 @@ def train():
     # sets seeds for numpy, torch and python.random.
     for fold in range(4):
         print(f"====== Fold: {fold} ======")
-        batch_size = 16
+        batch_size = 32
         wandb_logger = WandbLogger(
             project='rsna-breast-cancer', 
             job_type='train', 
@@ -329,16 +350,21 @@ def train():
             mode="min"
         )
         early_stopping_callback = EarlyStopping(monitor='val_loss', patience=2)
-        model = BreastCancerModel(learning_rate=1e-4, num_classes=1, batch_size=batch_size)
-        trainer = Trainer(accelerator="gpu", devices=1,
-                  logger=wandb_logger,
-                  callbacks=[checkpoint_callback, early_stopping_callback],
-                  max_epochs=4,
-                  progress_bar_refresh_rate=30,
-                  precision=16,
-                  fast_dev_run=DEBUG)
+        model = BreastCancerModel(learning_rate=3e-4, num_classes=1, batch_size=batch_size)
         data_dir = "/home/yassinealouini/Documents/Kaggle/rsna-breast-cancer-detection/1024_data/"
         dm = BreastCancerDataModule(data_dir=data_dir, batch_size=batch_size)
+        dm.setup()
+        val_samples = next(iter(dm.val_dataloader()))
+
+
+        trainer = Trainer(accelerator="gpu", devices=1,
+                  logger=wandb_logger,
+                  callbacks=[checkpoint_callback, early_stopping_callback, ImagePredictionLogger(val_samples)],
+                  max_epochs=4,
+                  progress_bar_refresh_rate=10,
+                  precision=16,
+                  fast_dev_run=DEBUG)
+
         trainer.fit(model, dm)
 
 
