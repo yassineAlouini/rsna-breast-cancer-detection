@@ -3,5 +3,6 @@
 lightning_logs/*
 wandb
 checkpoints/*
+models/*
 *egg-info*
 *__pycache__*
