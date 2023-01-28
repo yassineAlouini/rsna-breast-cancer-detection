@@ -31,6 +31,9 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from box import Box
 from rsna.metric import pfbeta_torch_thresh, pfbeta_torch
 import wandb
+from fastai.data.all import *
+
+
 
 stub = modal.Stub(name="train-rsna")
 image = modal.Image.debian_slim().run_commands(
@@ -66,6 +69,7 @@ USE_GPU = "any"
 # TODO: Why is this the optimal threshold? Most likely not...
 THRESHOLD = 0.402
 DEBUG = False
+MAX_EPOCHS=2
 
 # From https://www.kaggle.com/code/theoviel/rsna-breast-baseline-inference
 class Config:
@@ -85,7 +89,8 @@ class Config:
     k = 4  # Stratified GKF
 
     # Model
-    name = "tf_efficientnetv2_b2"
+    # TODO: How big is the s model?
+    name = "tf_efficientnetv2_s"
     pretrained_weights = None
     # Cancer or not cancer (so binary predictions)
     num_classes = 1
@@ -210,7 +215,7 @@ class ImagePredictionLogger(pl.callbacks.Callback):
         val_labels = self.val_labels.to(device=pl_module.device)
         # Get model prediction
         logits = pl_module(val_imgs)
-        preds = torch.argmax(logits, -1)
+        preds = torch.softmax(logits, -1)
         # Log the images as wandb Image
         trainer.logger.experiment.log({
             "examples":[wandb.Image(x, caption=f"Pred:{pred}, Label:{y}") 
@@ -220,21 +225,23 @@ class ImagePredictionLogger(pl.callbacks.Callback):
             })
         
 
-
+# TODO: How to fix the F1 wrong metric computation? Always 0....
 class BreastCancerModel(pl.LightningModule):
 
-    def __init__(self, num_classes, batch_size, learning_rate):
+    def __init__(self, model_name, num_classes, batch_size, learning_rate, len_train):
         super().__init__()
         self.num_classes = num_classes
         self.batch_size = batch_size
+        self.model_name = model_name
         self.learning_rate = learning_rate
-        # TODO: How was this weight computed?
-        self.loss_fn = nn.BCEWithLogitsLoss()
-        self.backbone = timm.create_model("tf_efficientnetv2_b0", pretrained=True)
+        self.len_train = len_train
+        # TODO: How was this weight computed? axis=-1 to flatten?
+        # self.loss_fn = nn.CrossEntropyLoss(weight=torch.tensor([1, 50]).float(), reduction="mean")
+        self.loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.as_tensor([1.0]))
+        self.backbone = timm.create_model(model_name, pretrained=True, drop_rate = 0.2, drop_path_rate = 0.0)
         final_in_features = self.backbone.classifier.in_features
         self.head = nn.Sequential(SelectAdaptivePool2d(pool_type='avg', flatten=Flatten()),
                                   nn.Linear(final_in_features, self.num_classes))
-        self.optimizer = optim.Adam(self.backbone.parameters(), lr=learning_rate)
 
     def forward(self, x):
         x = self.backbone.forward_features(x)
@@ -262,7 +269,7 @@ class BreastCancerModel(pl.LightningModule):
         # log loss to tensorboard
         self.log('val_loss', loss, on_epoch=True, prog_bar=True)
         # calculate F1 but probabilistic
-        # TODO: Add the threshold optimized one...
+        y_hat = torch.sigmoid(y_hat)
         score = pfbeta_torch(y_hat, y)
         thresh_score = pfbeta_torch_thresh(y_hat, y)
         self.log('val_pfbeta', score, on_epoch=True, prog_bar=True)
@@ -282,15 +289,21 @@ class BreastCancerModel(pl.LightningModule):
 
 
     def configure_optimizers(self):
-        optimizer = eval("optim.AdamW")(
+        optimizer = optim.AdamW(
             self.parameters(), lr=3e-4, betas=(0.9, 0.999),
+            weight_decay=1e-2
         )
-        # TODO: Something fancy?
-        # scheduler = eval(self.cfg.scheduler.name)(
-        #     optimizer,
-        #     **self.cfg.scheduler.params
-        # )
-        return [optimizer]
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=3e-4,
+            epochs=10,
+            steps_per_epoch=int(self.len_train / self.batch_size),
+            pct_start=0.1,
+            anneal_strategy="cos",
+            div_factor=1.0,
+            final_div_factor=10_000.0,
+        )
+        return [optimizer], [scheduler]
 
 
 class BreastCancerDataModule(pl.LightningDataModule):
@@ -312,10 +325,10 @@ class BreastCancerDataModule(pl.LightningDataModule):
         self.breast_val = BreastDataset(self.val_df, transforms)
 
     def train_dataloader(self):
-        return DataLoader(self.breast_train, batch_size=self.batch_size, num_workers=4)
+        return DataLoader(self.breast_train, batch_size=self.batch_size, num_workers=32)
 
     def val_dataloader(self):
-        return DataLoader(self.breast_val, batch_size=self.batch_size, num_workers=4, shuffle=True)
+        return DataLoader(self.breast_val, batch_size=self.batch_size, num_workers=32, shuffle=True)
 
     def test_dataloader(self):
         return DataLoader(self.breast_val, batch_size=self.batch_size)
@@ -330,11 +343,11 @@ def train():
     # sets seeds for numpy, torch and python.random.
     for fold in range(4):
         print(f"====== Fold: {fold} ======")
-        batch_size = 32
+        batch_size = 12
+        num_classes = 1
         wandb_logger = WandbLogger(
             project='rsna-breast-cancer', 
             job_type='train', 
-            # TODO: Make this work...
             config=class2dict(Config)
         )
         model_name = Config.name
@@ -350,18 +363,19 @@ def train():
             mode="min"
         )
         early_stopping_callback = EarlyStopping(monitor='val_loss', patience=2)
-        model = BreastCancerModel(learning_rate=3e-4, num_classes=1, batch_size=batch_size)
         data_dir = "/home/yassinealouini/Documents/Kaggle/rsna-breast-cancer-detection/1024_data/"
         dm = BreastCancerDataModule(data_dir=data_dir, batch_size=batch_size)
         dm.setup()
+        model = BreastCancerModel(model_name=model_name, learning_rate=3e-4, num_classes=num_classes, 
+                                  batch_size=batch_size, len_train=len(dm.breast_train))
         val_samples = next(iter(dm.val_dataloader()))
 
 
         trainer = Trainer(accelerator="gpu", devices=1,
                   logger=wandb_logger,
-                  callbacks=[checkpoint_callback, early_stopping_callback, ImagePredictionLogger(val_samples)],
-                  max_epochs=4,
-                  progress_bar_refresh_rate=10,
+                  callbacks=[checkpoint_callback, early_stopping_callback, ImagePredictionLogger(val_samples, num_samples=batch_size)],
+                  max_epochs=MAX_EPOCHS,
+                  progress_bar_refresh_rate=5,
                   precision=16,
                   fast_dev_run=DEBUG)
 

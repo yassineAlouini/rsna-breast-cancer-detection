@@ -11,14 +11,11 @@ import numpy as np
 from pdb import set_trace
 import wandb
 
-NUM_EPOCHS = 5
+NUM_EPOCHS = 4
 NUM_SPLITS = 4
-
+BATCH_SIZE = 16
 RESIZE_TO = (1024, 1024)
-
-# DATA_PATH = '/kaggle/input/rsna-breast-cancer-detection'
-# TEST_DICOM_DIR = '/kaggle/input/rsna-breast-cancer-detection/test_images'
-# MODEL_PATH = '/kaggle/input/rsna-trained-model-weights/tf_effv2_s_208_402/tf_effv2_s_208_402'
+SEED = 42
 
 label_smoothing_weights = torch.tensor([1,10]).float()
 if torch.cuda.is_available():
@@ -31,10 +28,10 @@ TRAIN_IMAGE_DIR = "/home/yassinealouini/Documents/Kaggle/rsna-breast-cancer-dete
 MODEL_PATH = '/home/yassinealouini/Documents/Kaggle/rsna-breast-cancer-detection/models/'
 train_csv = pd.read_csv(f'{DATA_PATH}/train.csv')
 patient_id_any_cancer = train_csv.groupby('patient_id').cancer.max().reset_index()
-skf = StratifiedKFold(NUM_SPLITS, shuffle=True, random_state=42)
+skf = StratifiedKFold(NUM_SPLITS, shuffle=True, random_state=SEED)
 splits = list(skf.split(patient_id_any_cancer.patient_id, patient_id_any_cancer.cancer))
 
-
+# TODO: Use the knowledge from here to fix the PyTorch-Lightning pipeline...
 
 wandb.init(project='rsna-breast-cancer')
 MODEL_NAME = 'tf_efficientnetv2_b2'
@@ -123,14 +120,16 @@ def get_dataloaders():
         item_tfms=Resize((1024, 1024))
     )
     dsets = dblock.datasets(train_image_path)
-    return dblock.dataloaders(train_image_path, batch_size=32)
+    return dblock.dataloaders(train_image_path, batch_size=BATCH_SIZE)
 
 def get_learner(arch=resnet18):
     learner = vision_learner(
         get_dataloaders(),
         arch,
+        # 512 is for ResNet18
+        # 1408 for b2
         custom_head=nn.Sequential(SelectAdaptivePool2d(pool_type='avg', flatten=Flatten()), 
-                                  nn.Linear(512, 2)),
+                                  nn.Linear(1408, 2)),
         metrics=[
             error_rate,
             AccumMetric(pfbeta_torch, activation=ActivationType.Softmax, flatten=False),
@@ -149,7 +148,7 @@ SPLIT = 0 # our learner needs this to construct its dataloaders...
 learn = get_learner(MODEL_NAME)
 
 for SPLIT in range(NUM_SPLITS):
-    learn = get_learner()
+    learn = get_learner(MODEL_NAME)
     learn.unfreeze()
     learn.fit_one_cycle(NUM_EPOCHS, 1e-4, pct_start=0.1)
     learn.save(f'{MODEL_PATH}/{SPLIT}_{MODEL_NAME}')
@@ -158,7 +157,6 @@ for SPLIT in range(NUM_SPLITS):
     preds.append(output[0])
     labels.append(output[1])
 
-# %%
 threshold = optimize_preds(torch.cat(preds), torch.cat(labels), return_thresh=True, print_results=True)
 print(threshold)
 
